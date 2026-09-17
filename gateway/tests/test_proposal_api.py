@@ -460,3 +460,53 @@ def test_orphan_payload_deleted_on_lost_idempotency_race():
     # ...and the payload frozen under the losing id is not left orphaned.
     assert payloads.get("loser") is None
     assert list(payloads.values()) == []
+
+
+def test_concurrent_propose_same_key_returns_one_effective_id(tmp_path):
+    # Face ① at the CALLER altitude (Jeff 207587): concurrent propose() for one
+    # idempotency_key must hand every caller the SAME single proposal_id -- a
+    # loser must never get back a second proposal it could confirm/send (checking
+    # the index points at one record is not enough; the returned id is what a
+    # caller acts on). Real SqliteKV backends + barrier-synced threads; the
+    # losers exercise propose()'s Duplicate recovery under a genuine race.
+    from gateway.persistence import SqliteKV
+
+    n = 8
+    for round_ in range(15):
+        proposals_kv = SqliteKV(str(tmp_path / ("p%d.db" % round_)))
+        payloads_kv = SqliteKV(str(tmp_path / ("pl%d.db" % round_)))
+        try:
+            ids = {"n": 0}
+            id_lock = threading.Lock()
+
+            def factory():
+                with id_lock:                       # id_factory is called concurrently
+                    ids["n"] += 1
+                    return "prop-%d" % ids["n"]
+
+            svc = ProposalService(
+                proposals=ProposalStore(proposals_kv), payloads=payloads_kv,
+                now=lambda: 1000, ttl_seconds=3600, proposal_id_factory=factory)
+            barrier = threading.Barrier(n)
+            returned = []
+            guard = threading.Lock()
+
+            def worker():
+                barrier.wait()
+                r = svc.propose(_params(idem="k"))
+                with guard:
+                    returned.append(r["proposal_id"])
+
+            threads = [threading.Thread(target=worker) for _ in range(n)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+            assert len(returned) == n
+            assert len(set(returned)) == 1, returned    # one effective id to ALL callers
+            # losers' frozen payloads were cleaned: exactly one payload persists
+            assert len(list(payloads_kv.values())) == 1
+        finally:
+            proposals_kv.close()
+            payloads_kv.close()

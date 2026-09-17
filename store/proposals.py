@@ -95,15 +95,30 @@ class ProposalStore:
             raise ProposalStateError("expires_at must be after created_at")
         if self._backend.get(proposal.proposal_id) is not None:
             raise ProposalStateError("proposal_id already exists")
+        # Write the proposal record BEFORE claiming the idempotency key, and make
+        # the claim an atomic test-and-set. Two properties fall out:
+        #   * concurrency -- the claim is a single-statement put-if-absent, so of
+        #     N concurrent proposes for one key exactly one wins; the losers get
+        #     False here and raise. A get-then-put would be a TOCTOU race under
+        #     the threaded proposal server (both see the key absent, both create
+        #     -> two proposals -> two sends).
+        #   * crash-safety -- the claim is the LAST durable step, so a crash
+        #     between the proposal write and the claim leaves at most an
+        #     unreferenced proposal (its id was never returned, so nothing can
+        #     confirm it; it just expires). It never leaves a claimed key
+        #     pointing at a missing proposal, which would make every later
+        #     propose for that key raise ProposalNotFound and wedge the key.
+        self._backend.put(proposal.proposal_id, proposal.to_dict())
         if proposal.idempotency_key is not None:
             idx = self._idem_index_key(proposal.idempotency_key)
-            if self._backend.get(idx) is not None:
+            if not self._backend.claim(idx, {"proposal_id": proposal.proposal_id}):
+                # Lost the claim: another proposal already owns this key. Roll
+                # back the record we just wrote so no loser proposal lingers,
+                # then signal the caller (ProposalService drops the frozen
+                # payload and returns the winning proposal's identifiers).
+                self._backend.delete(proposal.proposal_id)
                 raise DuplicateIdempotencyError(
                     "idempotency key already has a proposal")
-            # Claim the key up front so a concurrent duplicate cannot slip in
-            # between this check and the write.
-            self._backend.put(idx, {"proposal_id": proposal.proposal_id})
-        self._backend.put(proposal.proposal_id, proposal.to_dict())
         return proposal
 
     def get(self, proposal_id: str) -> Proposal:

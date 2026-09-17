@@ -154,3 +154,95 @@ def test_proposal_dict_round_trip(pid, created_at, ttl, status):
 def test_from_dict_rejects_malformed():
     with pytest.raises(ProposalStateError):
         Proposal.from_dict({"proposal_id": "p1"})  # missing fields
+
+
+# --- crash-safety: a partial create() must not wedge the idempotency key ----
+
+class _InjectedWriteError(RuntimeError):
+    """Stands in for a crash mid-create (a write that never durably commits)."""
+
+
+class _FlakyKV:
+    """Wraps InMemoryKV and raises *before* the Nth mutating call commits, to
+    simulate a crash partway through create(). Reads and the eventual retry run
+    against the same underlying store, so we observe exactly the state a real
+    crash would leave behind."""
+
+    def __init__(self, fail_on_write=None):
+        self._kv = InMemoryKV()
+        self._writes = 0
+        self._fail_on_write = fail_on_write  # 1-based index of the write to fail
+
+    def disarm(self):
+        self._fail_on_write = None
+
+    def _maybe_fail(self):
+        self._writes += 1
+        if self._writes == self._fail_on_write:
+            raise _InjectedWriteError("injected crash on write %d" % self._writes)
+
+    def get(self, key):
+        return self._kv.get(key)
+
+    def values(self):
+        return self._kv.values()
+
+    def put(self, key, value):
+        self._maybe_fail()          # raise before the write lands (never committed)
+        self._kv.put(key, value)
+
+    def claim(self, key, value):
+        self._maybe_fail()
+        return self._kv.claim(key, value)
+
+    def delete(self, key):
+        self._kv.delete(key)        # cleanup path; a crash here == a crash just before it
+
+
+@pytest.mark.parametrize("fail_on", [1, 2])
+def test_partial_create_failure_never_wedges_the_key(fail_on):
+    # Boris's failure-face ②: a crash partway through create() must not leave the
+    # idempotency key permanently unusable ("同键之后一直提交不了"). We fail each
+    # durable write in create() in turn -- fail_on=1 is the proposal write,
+    # fail_on=2 is the idempotency claim -- and assert that afterwards the key is
+    # still usable. fail_on=2 is the case that reds on the pre-fix ordering
+    # (claim-then-proposal): there the claim would already be written while the
+    # proposal is absent, so find_by_idempotency would raise ProposalNotFound
+    # forever. Writing the proposal FIRST and claiming LAST makes the claim the
+    # last durable step, so no partial failure leaves a claim without a proposal.
+    kv = _FlakyKV(fail_on_write=fail_on)
+    store = ProposalStore(kv)
+    with pytest.raises(_InjectedWriteError):
+        store.create(_p(pid="first", idem="k1"))
+
+    kv.disarm()
+    # Not wedged: the claim never durably committed, so the key reads as free
+    # (never a dangling claim that makes find_by_idempotency raise).
+    assert store.find_by_idempotency("k1") is None
+    # ...and a clean retry on the same key succeeds.
+    store.create(_p(pid="retry", idem="k1"))
+    assert store.find_by_idempotency("k1").proposal_id == "retry"
+
+
+def test_dangling_claim_is_the_wedge_the_ordering_prevents():
+    # Positive control for the invariant above: prove the wedge state is real.
+    # A claim pointing at a missing proposal (what the pre-fix ordering could
+    # leave on a crash) is exactly what makes find_by_idempotency raise -- so the
+    # "is None" assertion in the test above is non-trivial.
+    kv = InMemoryKV()
+    store = ProposalStore(kv)
+    kv.claim("idem:k1", {"proposal_id": "ghost"})   # claimed, but no "ghost" proposal
+    with pytest.raises(ProposalNotFoundError):
+        store.find_by_idempotency("k1")
+
+
+def test_lost_claim_rolls_back_the_loser_proposal():
+    # The loser of an idempotency claim must not leave its proposal record
+    # behind: create() rolls it back before raising, so only the winner survives.
+    s = _store()
+    s.create(_p(pid="winner", idem="k1"))
+    with pytest.raises(DuplicateIdempotencyError):
+        s.create(_p(pid="loser", idem="k1"))
+    with pytest.raises(ProposalNotFoundError):
+        s.get("loser")                               # loser record rolled back
+    assert s.find_by_idempotency("k1").proposal_id == "winner"

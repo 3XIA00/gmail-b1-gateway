@@ -18,6 +18,13 @@ class KVBackend(Protocol):
 
     def get(self, key: str) -> Optional[dict]: ...
     def put(self, key: str, value: dict) -> None: ...
+    # claim = atomic put-if-absent: write `value` only if `key` is absent,
+    # returning whether THIS caller won. The proposal store's idempotency claim
+    # needs a genuine test-and-set -- a get-then-put pair races under the
+    # threaded proposal server (two writers both see the key absent and both
+    # write). The load-bearing cross-process guarantee lives in the SQLite
+    # backend; it is part of the seam so the store logic can rely on it.
+    def claim(self, key: str, value: dict) -> bool: ...
     def values(self) -> Iterator[dict]: ...
     # delete is idempotent (no-op on an absent key): the only caller is the
     # orphan-payload cleanup on a lost idempotency race, which must not itself
@@ -42,6 +49,17 @@ class InMemoryKV:
 
     def put(self, key: str, value: dict) -> None:
         self._d[key] = dict(value)
+
+    def claim(self, key: str, value: dict) -> bool:
+        # Atomic put-if-absent even under threads: dict.setdefault is a single
+        # C-level op, so two threads can't both see the key absent and both write
+        # (the plain `if key in ...: self._d[key] = ...` pair CAN interleave --
+        # Linus 207645). We won iff the object WE built is the one that landed.
+        # The load-bearing cross-process guarantee is still asserted against the
+        # real SqliteKV.claim (ON CONFLICT DO NOTHING), not here; this only keeps
+        # the TEST backend from being a latent multi-thread flake.
+        placed = dict(value)
+        return self._d.setdefault(key, placed) is placed
 
     def delete(self, key: str) -> None:
         self._d.pop(key, None)  # idempotent
